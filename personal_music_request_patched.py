@@ -17,19 +17,22 @@ import platform
 import signal
 import tempfile
 import shutil
-import platform
-import subprocess
-import time
-import logging
-from ctypes import POINTER, cast
-from comtypes import CLSCTX_ALL
-from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+
+# Windows 전용 임포트
+try:
+    from ctypes import POINTER, cast
+    from comtypes import CLSCTX_ALL
+    from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
+    PYCAW_AVAILABLE = True
+except ImportError:
+    PYCAW_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # ==== CONFIG: Chrome profile for AdBlock ====
 MUSIC_CHROME_USER_DATA_DIR = os.environ.get(
     "MUSIC_CHROME_USER_DATA_DIR",
-    r"C:\chrome_profiles\music_app"   # A안에서 만든 전용 프로필 경로
+    r"C:\chrome_profiles\music_app"   # 앱에서 만든 전용 프로필 경로
 )
 MUSIC_CHROME_PROFILE = os.environ.get("MUSIC_CHROME_PROFILE", "Default")  # 보통 'Default'
 # ============================================
@@ -56,7 +59,7 @@ STATS_FILE = 'music_stats.json'
 USERS_FILE = 'users.json'
 
 class BrowserPlayer:
-    """OS별로 Chrome/Chromium을 전용 프로필로 실행/종료 (AdBlock 유지)"""
+    """OS별로 Chrome/Chromium을 전용 프로필로 실행/종료 (AdBlock 유지) - 자동재생 지원"""
     def __init__(self, user_data_dir=None, profile_dir=None):
         self.system = platform.system()
         self.proc = None
@@ -69,9 +72,16 @@ class BrowserPlayer:
         import shutil, os
         if self.system == "Windows":
             # chrome or edge
-            return (shutil.which("chrome") or shutil.which("msedge") or
-                    r"C:\Program Files\Google\Chrome\Application\chrome.exe" or
-                    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe")
+            paths = [
+                shutil.which("chrome"),
+                shutil.which("msedge"),
+                r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+                r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
+            ]
+            for path in paths:
+                if path and os.path.exists(path):
+                    return path
         elif self.system == "Darwin":
             path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
             if os.path.exists(path):
@@ -81,6 +91,7 @@ class BrowserPlayer:
             return (shutil.which("google-chrome") or
                     shutil.which("chromium-browser") or
                     shutil.which("chromium"))
+        return None
 
     def _chrome_cmd(self, url):
         import os, tempfile
@@ -105,14 +116,40 @@ class BrowserPlayer:
         if self.profile_dir:
             args.append(f"--profile-directory={self.profile_dir}")
 
-        # 확장 작동 유지: --app 윈도우에서도 콘텐츠 스크립트(차단)가 동작
-        args += ["--new-window", f"--app={url}"]
+        # 자동재생을 위한 중요한 플래그들 추가
+        args += [
+            "--autoplay-policy=no-user-gesture-required",  # 자동재생 허용
+            "--disable-features=PreloadMediaEngagementData,MediaEngagementBypassAutoplayPolicies",
+            "--disable-blink-features=AutomationControlled",  # 자동화 감지 비활성화
+            "--start-maximized",  # 최대화로 시작
+            "--disable-infobars",  # 정보 표시줄 비활성화
+            "--no-first-run",  # 첫 실행 설정 건너뛰기
+            "--disable-default-apps",
+            url  # URL을 직접 전달 (--app 모드 대신 일반 모드로)
+        ]
 
-        return [chrome, *args]
+        return [chrome] + args
+
+    def _create_autoplay_url(self, youtube_url):
+        """YouTube URL에 자동재생 파라미터 추가"""
+        if "youtube.com/watch" in youtube_url:
+            # URL에 autoplay 파라미터가 없으면 추가
+            if "autoplay=" not in youtube_url:
+                separator = "&" if "?" in youtube_url else "?"
+                youtube_url = f"{youtube_url}{separator}autoplay=1&mute=0"
+            else:
+                # autoplay가 있으면 1로 설정
+                import re
+                youtube_url = re.sub(r'autoplay=\d', 'autoplay=1', youtube_url)
+        return youtube_url
 
     def play(self, url):
         import subprocess, os
         self.stop()  # 이전 인스턴스 정리
+
+        # YouTube URL에 자동재생 파라미터 추가
+        url = self._create_autoplay_url(url)
+
         cmd = self._chrome_cmd(url)
         if cmd is None:
             import webbrowser
@@ -128,8 +165,29 @@ class BrowserPlayer:
             preexec_fn = os.setsid
 
         logging.info(f"Chrome 프로필 사용: {self.user_dir} / {self.profile_dir} (ephemeral={self.ephemeral})")
-        self.proc = subprocess.Popen(cmd, creationflags=creationflags, preexec_fn=preexec_fn)
-        return True
+        logging.info(f"자동재생 URL: {url}")
+
+        try:
+            self.proc = subprocess.Popen(cmd, creationflags=creationflags, preexec_fn=preexec_fn)
+
+            # 브라우저가 완전히 로드될 때까지 잠시 대기
+            time.sleep(2)
+
+            # JavaScript를 통한 자동재생 시도 (선택사항 - pyautogui 필요)
+            try:
+                import pyautogui
+                # 스페이스바를 눌러 재생 (YouTube 단축키)
+                pyautogui.press('space')
+                logging.info("자동재생 트리거 시도 (스페이스바)")
+            except ImportError:
+                logging.info("pyautogui가 설치되지 않아 키보드 트리거를 건너뜁니다")
+            except Exception as e:
+                logging.warning(f"자동재생 트리거 실패: {e}")
+
+            return True
+        except Exception as e:
+            logging.error(f"브라우저 실행 실패: {e}")
+            return False
 
     def stop(self):
         import subprocess, os, signal, shutil
@@ -491,17 +549,22 @@ class PremiumMusicRequest:
                 }
                 self.save_current_playing(self.current_playing)
                 self.save_requests()
+
+                # 브라우저에서 YouTube 재생
                 played = self.player.play(music_info['url']) if hasattr(self, "player") else False
                 if not played:
                     logger.warning("제어 불가 모드(webbrowser)로 재생되었을 수 있습니다.")
+
                 end_at = time.time() + duration
                 while time.time() < end_at and self.is_playing and not self.stop_event.is_set():
                     time.sleep(0.5)
+
                 try:
                     if hasattr(self, "player"):
                         self.player.stop()
                 except Exception as e:
                     logger.warning(f"플레이어 종료 중 경고: {e}")
+
                 if self.stop_event.is_set() or not self.is_playing:
                     current_request['status'] = 'stopped'
                 else:
@@ -510,9 +573,11 @@ class PremiumMusicRequest:
                         self.update_stats('play_completed', current_request['requester'], music_info)
                     except Exception as e:
                         logger.warning(f"통계 업데이트 경고: {e}")
+
                 self.current_playing = None
                 self.save_current_playing(None)
                 self.save_requests()
+
                 if current_request['status'] == 'completed':
                     if hasattr(self, "play_history"):
                         self.play_history.append({
@@ -578,7 +643,7 @@ class VolumeController:
         self.current_volume = 50  # 비-Windows 또는 실패 시 내부 상태용
         self._endpoint = None
 
-        if self.system == "Windows":
+        if self.system == "Windows" and PYCAW_AVAILABLE:
             try:
                 devices = AudioUtilities.GetSpeakers()  # 기본 재생 장치
                 interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
