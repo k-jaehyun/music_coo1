@@ -23,6 +23,14 @@ import time
 import logging
 logger = logging.getLogger(__name__)
 
+# ==== CONFIG: Chrome profile for AdBlock ====
+MUSIC_CHROME_USER_DATA_DIR = os.environ.get(
+    "MUSIC_CHROME_USER_DATA_DIR",
+    r"C:\chrome_profiles\music_app"   # A안에서 만든 전용 프로필 경로
+)
+MUSIC_CHROME_PROFILE = os.environ.get("MUSIC_CHROME_PROFILE", "Default")  # 보통 'Default'
+# ============================================
+
 # 로깅 설정
 logging.basicConfig(
     level=logging.INFO,
@@ -45,46 +53,68 @@ STATS_FILE = 'music_stats.json'
 USERS_FILE = 'users.json'
 
 class BrowserPlayer:
-    """OS별로 Chrome/Chromium을 프로세스로 실행/종료"""
-    def __init__(self):
+    """OS별로 Chrome/Chromium을 전용 프로필로 실행/종료 (AdBlock 유지)"""
+    def __init__(self, user_data_dir=None, profile_dir=None):
         self.system = platform.system()
         self.proc = None
-        self.user_dir = None
+        # 전용 프로필(권장) 지정: 없으면 임시 프로필로 폴백
+        self.user_dir = user_data_dir or MUSIC_CHROME_USER_DATA_DIR
+        self.profile_dir = profile_dir or MUSIC_CHROME_PROFILE
+        self.ephemeral = False  # 전용 프로필 사용 시 False
+
+    def _resolve_browser_path(self):
+        import shutil, os
+        if self.system == "Windows":
+            # chrome or edge
+            return (shutil.which("chrome") or shutil.which("msedge") or
+                    r"C:\Program Files\Google\Chrome\Application\chrome.exe" or
+                    r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe")
+        elif self.system == "Darwin":
+            path = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+            if os.path.exists(path):
+                return path
+            return shutil.which("google-chrome") or shutil.which("chromium")
+        else:  # Linux
+            return (shutil.which("google-chrome") or
+                    shutil.which("chromium-browser") or
+                    shutil.which("chromium"))
 
     def _chrome_cmd(self, url):
-        import shutil, os, tempfile
-        self.user_dir = tempfile.mkdtemp(prefix="yt_session_")
-        args = [f"--user-data-dir={self.user_dir}", "--new-window", f"--app={url}"]
+        import os, tempfile
+        chrome = self._resolve_browser_path()
+        if not chrome:
+            return None
 
-        if self.system == "Windows":
-            chrome = shutil.which("chrome") or shutil.which("msedge") \
-                     or r"C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe" or r"C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe"
-            if not chrome:
-                return None
-            return [chrome, *args]
+        # 전용 프로필 경로 보장 (없으면 생성)
+        args = []
+        user_dir = self.user_dir
+        if not user_dir:
+            # 최후의 수단: 임시 프로필(확장 없음)
+            user_dir = tempfile.mkdtemp(prefix="yt_session_")
+            self.ephemeral = True
+        else:
+            os.makedirs(user_dir, exist_ok=True)
+            self.ephemeral = False
 
-        elif self.system == "Darwin":
-            chrome = "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
-            if not os.path.exists(chrome):
-                chrome = shutil.which("google-chrome") or shutil.which("chromium")
-                if not chrome:
-                    return None
-            return [chrome, *args]
+        args.append(f"--user-data-dir={user_dir}")
 
-        else:  # Linux
-            chrome = shutil.which("google-chrome") or shutil.which("chromium-browser") or shutil.which("chromium")
-            if not chrome:
-                return None
-            return [chrome, *args]
+        # 프로필 디렉터리(보통 'Default') 지정
+        if self.profile_dir:
+            args.append(f"--profile-directory={self.profile_dir}")
+
+        # 확장 작동 유지: --app 윈도우에서도 콘텐츠 스크립트(차단)가 동작
+        args += ["--new-window", f"--app={url}"]
+
+        return [chrome, *args]
 
     def play(self, url):
         import subprocess, os
-        self.stop()  # 기존 인스턴스 정리
+        self.stop()  # 이전 인스턴스 정리
         cmd = self._chrome_cmd(url)
         if cmd is None:
-            # 제어 불가 fallback
             import webbrowser
             webbrowser.open(url)
+            logging.warning("브라우저 경로를 찾지 못해 webbrowser로 폴백되었습니다.")
             return False
 
         creationflags = 0
@@ -94,16 +124,18 @@ class BrowserPlayer:
         else:
             preexec_fn = os.setsid
 
+        logging.info(f"Chrome 프로필 사용: {self.user_dir} / {self.profile_dir} (ephemeral={self.ephemeral})")
         self.proc = subprocess.Popen(cmd, creationflags=creationflags, preexec_fn=preexec_fn)
         return True
 
     def stop(self):
         import subprocess, os, signal, shutil
         if not self.proc:
-            # 그래도 남아있을 수 있는 임시 프로필 정리
-            if self.user_dir and os.path.isdir(self.user_dir):
+            # 임시 프로필 쓰던 경우만 정리
+            if self.ephemeral and self.user_dir and os.path.isdir(self.user_dir):
                 shutil.rmtree(self.user_dir, ignore_errors=True)
-                self.user_dir = None
+                self.user_dir = MUSIC_CHROME_USER_DATA_DIR  # 원상 복귀
+                self.ephemeral = False
             return
         try:
             if self.system == "Windows":
@@ -124,9 +156,11 @@ class BrowserPlayer:
                         pass
         finally:
             self.proc = None
-            if self.user_dir and os.path.isdir(self.user_dir):
+            # 전용 프로필은 절대 지우지 않음
+            if self.ephemeral and self.user_dir and os.path.isdir(self.user_dir):
                 shutil.rmtree(self.user_dir, ignore_errors=True)
-            self.user_dir = None
+            self.ephemeral = False
+            self.user_dir = MUSIC_CHROME_USER_DATA_DIR
 
 
 class PremiumMusicRequest:
@@ -141,7 +175,10 @@ class PremiumMusicRequest:
         self.max_requests_per_user = 5  # 사용자당 최대 요청 수
         self.request_cooldown = 300  # 5분 쿨다운
         self.stop_event = threading.Event()
-        self.player = BrowserPlayer()
+        self.player = BrowserPlayer(
+            user_data_dir=MUSIC_CHROME_USER_DATA_DIR,
+            profile_dir=MUSIC_CHROME_PROFILE
+        )
 
     def load_requests(self):
         """음악 요청 목록 로드"""
