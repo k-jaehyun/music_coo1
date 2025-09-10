@@ -21,6 +21,9 @@ import platform
 import subprocess
 import time
 import logging
+from ctypes import POINTER, cast
+from comtypes import CLSCTX_ALL
+from pycaw.pycaw import AudioUtilities, IAudioEndpointVolume
 logger = logging.getLogger(__name__)
 
 # ==== CONFIG: Chrome profile for AdBlock ====
@@ -523,39 +526,50 @@ class PremiumMusicRequest:
                 self.stop_event.wait(timeout=1.0)
 
 class VolumeController:
-    """시스템 음량 조절 (간단 안전판: 없으면 로그만 남김)"""
+    """시스템 음량 조절 (Windows: WASAPI/IAudioEndpointVolume 사용)"""
     def __init__(self):
         self.system = platform.system()
-        self.current_volume = 50
-        logger.info(f"음량 조절기 초기화: {self.system}")
+        self.current_volume = 50  # 비-Windows 또는 실패 시 내부 상태용
+        self._endpoint = None
 
-    def set_volume(self, volume_percent):
-        """0~100 범위로 클램프 후 OS별 시도, 실패하면 경고만"""
-        try:
-            volume_percent = max(0, min(100, int(volume_percent)))
-            self.current_volume = volume_percent
-            if self.system == "Windows":
-                # 간단 모드: 일단 로그만. (원하시면 PowerShell/도구 연동 추가 가능)
-                logger.info(f"[윈도우] 음량 {volume_percent}% (샘플 구현: 외부 도구 미사용)")
-            elif self.system == "Darwin":
-                # macOS: osascript 시도
-                cmd = f"osascript -e 'set volume output volume {volume_percent}'"
-                subprocess.run(cmd, shell=True, check=False)
-            elif self.system == "Linux":
-                # Linux: amixer 시도 (없으면 실패해도 무시)
-                cmd = f"amixer -D pulse sset Master {volume_percent}%"
-                subprocess.run(cmd, shell=True, check=False)
-            else:
-                logger.warning(f"지원되지 않는 OS: {self.system}")
-            return True
-        except Exception as e:
-            logger.warning(f"음량 설정 실패(무시): {e}")
-            return False
+        if self.system == "Windows":
+            try:
+                devices = AudioUtilities.GetSpeakers()  # 기본 재생 장치
+                interface = devices.Activate(IAudioEndpointVolume._iid_, CLSCTX_ALL, None)
+                self._endpoint = cast(interface, POINTER(IAudioEndpointVolume))
+            except Exception as e:
+                logger.warning(f"WASAPI 초기화 실패(내부 상태로 폴백): {e}")
 
-    def get_volume(self):
-        """현재 볼륨 퍼센트 반환 (임시: 내부 상태 기반)"""
-        # 실제 OS 볼륨 조회가 필요하면 추후 Windows용 PowerShell/외부도구 연동 추가
+    def set_volume(self, volume_percent: int) -> bool:
+        """0~100 정수 볼륨. Windows에선 실제 시스템 마스터 볼륨을 조절."""
+        v = max(0, min(100, int(volume_percent)))
+        if self._endpoint:  # Windows + WASAPI 성공
+            try:
+                self._endpoint.SetMasterVolumeLevelScalar(v / 100.0, None)
+                return True
+            except Exception as e:
+                logger.warning(f"WASAPI 볼륨 설정 실패(폴백): {e}")
+        # 폴백(비-Windows 또는 실패)
+        self.current_volume = v
+        return False
+
+    def get_volume(self) -> int:
+        """현재 볼륨(%)"""
+        if self._endpoint:
+            try:
+                return int(round(self._endpoint.GetMasterVolumeLevelScalar() * 100))
+            except Exception as e:
+                logger.warning(f"WASAPI 볼륨 조회 실패(폴백): {e}")
         return getattr(self, "current_volume", 50)
+
+    def mute(self, on: bool) -> bool:
+        if self._endpoint:
+            try:
+                self._endpoint.SetMute(bool(on), None)
+                return True
+            except Exception as e:
+                logger.warning(f"WASAPI 음소거 실패: {e}")
+        return False
 
 
 # 전역 인스턴스
