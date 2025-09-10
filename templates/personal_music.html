@@ -619,7 +619,7 @@
             <h2><i class="fas fa-list"></i> 요청 목록</h2>
 
             <div id="requestList" class="request-list">
-                {% for request in requests %}
+                {% for request in requests if request.status != 'completed' and request.status != 'stopped' %}
                 <div class="request-item">
                     <div class="request-status status-{{ request.status }}"></div>
                     <div class="request-info">

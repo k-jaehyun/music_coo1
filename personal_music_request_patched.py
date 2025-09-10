@@ -182,6 +182,7 @@ class PremiumMusicRequest:
             user_data_dir=MUSIC_CHROME_USER_DATA_DIR,
             profile_dir=MUSIC_CHROME_PROFILE
         )
+        self.resolve_stale_states()
 
     def load_requests(self):
         """음악 요청 목록 로드"""
@@ -443,6 +444,8 @@ class PremiumMusicRequest:
     def start_auto_play(self):
         """자동 재생 시작"""
         if not self.is_playing:
+            # 스레드 시작 전에 고아 상태 정리
+            self.resolve_stale_states()
             self.is_playing = True
             if hasattr(self, "stop_event"):
                 self.stop_event.clear()
@@ -524,6 +527,49 @@ class PremiumMusicRequest:
             except Exception as e:
                 logger.error(f"자동 재생 루프 오류: {e}")
                 self.stop_event.wait(timeout=1.0)
+
+    def resolve_stale_states(self):
+        repaired = 0
+        now = datetime.now()
+        cur = self.current_playing  # {'request_id','started_at','duration',...} 일 수 있음
+
+        # 1) current_playing 기반으로 마지막 곡 정리
+        if cur:
+            target_id = cur.get('request_id')
+            started_at = None
+            try:
+                if cur.get('started_at'):
+                    started_at = datetime.fromisoformat(cur['started_at'])
+            except Exception:
+                started_at = None
+            duration = int(cur.get('duration', 180))
+
+            for r in self.requests:
+                if r.get('id') == target_id:
+                    # 시간이 지났으면 completed(+통계), 아니면 stopped
+                    if started_at and (started_at + timedelta(seconds=duration) <= now):
+                        r['status'] = 'completed'
+                        try:
+                            self.update_stats('play_completed', r.get('requester'), r.get('music'))
+                        except Exception as e:
+                            logger.warning(f"통계 업데이트 경고: {e}")
+                    else:
+                        r['status'] = 'stopped'
+                    repaired += 1
+                    break
+
+            self.current_playing = None
+            self.save_current_playing(None)
+
+        # 2) 기타 고아 playing 모두 정리
+        for r in self.requests:
+            if r.get('status') == 'playing':
+                r['status'] = 'stopped'
+                repaired += 1
+
+        if repaired:
+            self.save_requests()
+            logger.warning(f"복구: 고아 playing {repaired}건 정리됨")
 
 class VolumeController:
     """시스템 음량 조절 (Windows: WASAPI/IAudioEndpointVolume 사용)"""
